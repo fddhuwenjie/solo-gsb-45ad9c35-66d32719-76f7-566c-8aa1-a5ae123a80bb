@@ -1,4 +1,4 @@
-"""FastAPI 应用入口：展品登记、读数上报（幂等 + 存证收据）、剂量时段查询、展陈开放日历、重复档案归并、RFID 盘点对账、多来源读数仲裁。"""
+"""FastAPI 应用入口：展品登记、读数上报（幂等 + 存证收据）、剂量时段查询、展陈开放日历、重复档案归并、RFID 盘点对账、多来源读数仲裁、照度异常处置单。"""
 from __future__ import annotations
 
 import json
@@ -58,6 +58,11 @@ from .schemas import (
     EvacuationResponse,
     ExhibitCreate,
     ExhibitOut,
+    IlluminationTicketCloseOut,
+    IlluminationTicketCloseRequest,
+    IlluminationTicketCreate,
+    IlluminationTicketListOut,
+    IlluminationTicketOut,
     IngestResponse,
     InventoryRoundOut,
     MergeCommitOut,
@@ -96,6 +101,7 @@ from .snapshots import (
     snapshot_db_path,
     verify_snapshot,
 )
+from .tickets import close_ticket, create_ticket, get_ticket, list_tickets
 
 
 @asynccontextmanager
@@ -108,7 +114,7 @@ async def lifespan(_: FastAPI) -> Iterator[None]:
 
 app = FastAPI(
     title="馆藏展品光照剂量核算 API",
-    version="1.9.0",
+    version="1.10.0",
     description="登记展品光照上限，接收乱序/补传照度读数，按梯形法累计 lux·h，缺测段不插值；"
                 "支持展陈开放日历（IANA 时区 + 每周时段 + 日期例外），剂量可按开放时段裁剪核算；"
                 "支持重复展品档案预演归并，来源 ID 归并后成为目标 ID 的永久别名；"
@@ -134,7 +140,13 @@ app = FastAPI(
                 "档案归并保留双方既有链、新上报继续接入目标原链；"
                 "支持可验证的 SQLite 在线快照（sqlite3 backup 事务一致副本、"
                 "临时文件 + SHA-256 清单 + 原子重命名发布、只读连接执行 "
-                "integrity_check / foreign_key_check 校验）。",
+                "integrity_check / foreign_key_check 校验）；"
+                "支持照度异常处置单：创建时在单个事务内按未作废权威时间线重算诊断事件与 "
+                "calendar=display 剂量，连同收据链末端哈希固化快照并返回 digest"
+                "（request_key 幂等，快照不可变）；结案只能从 open 到 resolved/accepted，"
+                "提交 expected_digest 与当前重算核对（读数/作废/来源优先级/日历/收据链"
+                "变化导致不一致 → 409 不写入），resolved 须举证涉及收据或更正 "
+                "request_key 并证明原事件消失且剂量未越限，accepted 保留事件并记录理由。",
     lifespan=lifespan,
 )
 
@@ -950,6 +962,88 @@ def get_authoritative_timeline(
         arbitrated=bool(versions),
         entries=entries,
     )
+
+
+# ---------- 照度异常处置单 ----------
+
+@app.post("/exhibits/{exhibit_id}/illumination-tickets",
+          response_model=IlluminationTicketOut, tags=["tickets"])
+def create_illumination_ticket(
+    exhibit_id: str,
+    payload: IlluminationTicketCreate,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> IlluminationTicketOut:
+    """创建照度异常处置单：固化诊断/剂量/收据链快照并返回 digest。
+
+    - 请求 ID 可用归并别名（自动解析到规范档案）；请求给出处置时间窗
+      （``start`` / ``end``）、诊断阈值（与诊断接口同口径的
+      ``max_rate_lux_per_second`` / ``stuck_tolerance_lux`` /
+      ``min_stuck_seconds``）与创建幂等键 ``request_key``；
+    - 服务在**一个 SQLite 事务**内按**未作废权威时间线**重算诊断事件
+      （gap / jump / stuck / timestamp_conflict）与 ``calendar=display``
+      剂量，连同**收据链末端哈希**、未作废读数指纹、来源优先级配置指纹与
+      日历指纹一起固化快照（``snapshot``），并返回其 SHA-256 摘要
+      ``digest``；展品未配置展陈开放日历 → **409**；
+    - 快照**不可变**：相同 ``request_key`` 且目标一致重放首次创建的原件
+      （``already_committed=true``），换目标（规范档案/时间窗/诊断阈值
+      不同）→ **409**。
+    """
+    return create_ticket(conn, exhibit_id, payload)
+
+
+@app.get("/exhibits/{exhibit_id}/illumination-tickets",
+         response_model=IlluminationTicketListOut, tags=["tickets"])
+def list_illumination_tickets(
+    exhibit_id: str,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> IlluminationTicketListOut:
+    """列出规范档案的全部处置单（按创建时刻与 ID 升序）；别名自动解析。"""
+    exhibit, tickets = list_tickets(conn, exhibit_id)
+    return IlluminationTicketListOut(
+        requested_id=exhibit_id, canonical_id=exhibit["id"], tickets=tickets,
+    )
+
+
+@app.get("/illumination-tickets/{ticket_id}",
+         response_model=IlluminationTicketOut, tags=["tickets"])
+def get_illumination_ticket(
+    ticket_id: str,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> IlluminationTicketOut:
+    """按 ticket_id 读取处置单；open 状态附带实时重算的 ``current_digest``。
+
+    ``current_digest`` 是按当前库内状态重算的快照摘要：结案前 GET 取回它
+    作为 ``expected_digest``，即可保证结案提交后若读数、作废、来源优先级、
+    日历或收据链再发生变化，服务端重算摘要不一致而 409。无法重算
+    （如日历已删除）时 ``current_digest`` 为 null。
+    """
+    out = get_ticket(conn, ticket_id)
+    if out is None:
+        raise HTTPException(status_code=404, detail=f"处置单不存在: {ticket_id}")
+    return out
+
+
+@app.post("/illumination-tickets/{ticket_id}/close",
+          response_model=IlluminationTicketCloseOut, tags=["tickets"])
+def close_illumination_ticket(
+    ticket_id: str,
+    payload: IlluminationTicketCloseRequest,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> IlluminationTicketCloseOut:
+    """把 open 处置单结案为 resolved 或 accepted（只能从 open 结案）。
+
+    - 提交 ``expected_digest``、``decision`` 与说明 ``note``；服务在写事务内
+      **重算当前摘要**，读数、作废、来源优先级、日历或收据链的任何变化
+      导致摘要不同 → **409 且不写入**；
+    - ``resolved`` 须给出涉及的存证收据（``receipt_ids``）或批次更正
+      （``correction_request_keys``）至少一项（须属于本规范档案，否则 422），
+      并证明重算后**原诊断事件全部消失**且 ``calendar=display`` 剂量
+      **未越限**，否则 409；
+    - ``accepted`` 保留事件，只在 ``note`` 中记录理由（不接受证据引用）；
+    - 已结案（resolved/accepted）的处置单再次结案 → **409**；
+      结案只写结案列，创建时固化的快照与 digest 保持不可变。
+    """
+    return close_ticket(conn, ticket_id, payload)
 
 
 # ---------- 重复档案归并 ----------

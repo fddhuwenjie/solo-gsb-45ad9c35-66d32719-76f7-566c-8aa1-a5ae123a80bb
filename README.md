@@ -51,6 +51,14 @@
   更正记录在一个 SQLite 事务内幂等落库，重复 `request_key` 重放原结果、
   换目标 409；剂量查询、采集质量诊断与读数列表立即排除已作废读数并按剩余
   时间线重算，收据内容、序号与链哈希保持不变（查询收据时标出作废状态）。
+- 支持**照度异常处置单**：创建时提交展品 ID（可用别名）、时间窗、诊断阈值
+  与 `request_key`，服务在**一个 SQLite 事务**内按未作废权威时间线重算
+  诊断事件与 `calendar=display` 剂量，连同**收据链末端哈希**固化快照并
+  返回 `digest`；处置单只能从 `open` 结案为 `resolved` 或 `accepted`——
+  提交 `expected_digest`、决定与说明，读数、作废、来源优先级、日历或收据链
+  变化导致摘要不同则 **409 且不写入**；`resolved` 须给出涉及的收据或更正
+  `request_key` 并证明重算后原事件消失、剂量未越限，`accepted` 保留事件并
+  记录理由；相同 `request_key` 重放原结果，快照不可变。
 - 提供**可验证的 SQLite 在线快照**：`sqlite3.Connection.backup` 热备生成
   事务一致副本（临时文件 → SHA-256 + 清单 → 原子重命名发布），支持
   创建 / 列表 / 下载，并可在独立只读连接上核对哈希、执行
@@ -93,6 +101,10 @@ SQLite 数据文件存放在命名卷 `lightdose-data`（容器内 `/data/lightd
 | GET | `/exhibits/{id}/receipts/{seq}` | 查询单张存证收据（已作废批次在 `voids` 标出） |
 | POST | `/exhibits/{id}/receipts/corrections` | 照度上报批次更正：作废收据中实际插入的读数（幂等，request_key 重放/409） |
 | GET | `/exhibits/{id}/receipts/verify` | 整链校验规范档案的收据链 |
+| POST | `/exhibits/{id}/illumination-tickets` | 创建照度异常处置单：单事务内重算诊断事件 + `calendar=display` 剂量并固化快照，返回 digest（request_key 幂等） |
+| GET | `/exhibits/{id}/illumination-tickets` | 列出规范档案的全部处置单（别名自动解析） |
+| GET | `/illumination-tickets/{ticket_id}` | 查询单张处置单；open 状态附带实时重算的 `current_digest` |
+| POST | `/illumination-tickets/{ticket_id}/close` | 结案：open → resolved / accepted（expected_digest 核对，不一致 409 不写入） |
 | GET | `/receipts/chains/{chain_id}` | 按链标识直接读取收据链（不解析别名） |
 | GET | `/receipts/chains/{chain_id}/verify` | 按链标识整链校验（归并后来源链核查） |
 | POST | `/exhibits/{id}/readings/diagnose` | 照度采集质量诊断（gap / jump / stuck / 时间冲突，只读） |
@@ -835,6 +847,195 @@ curl -s -X POST http://localhost:8000/exhibits/<id>/receipts/corrections \
 > 同数据重新上报记为 `duplicate`（读数保持作废态，不会“复活”），同 ID
 > 不同数据记为 `conflict`；需要以新读数替换时请使用新的读数 ID。
 
+## 照度异常处置单
+
+诊断发现照度异常（gap / jump / stuck / timestamp_conflict）后，可开立
+**照度异常处置单**跟踪处置过程：
+
+- **创建即固化快照**：`POST /exhibits/{id}/illumination-tickets` 提交展品 ID
+  （可用归并别名）、处置时间窗、诊断阈值（与诊断接口同口径）与
+  `request_key`。服务在**一个 SQLite 事务**（`BEGIN IMMEDIATE`）内按
+  **未作废权威时间线**重算诊断事件（与 `POST /readings/diagnose` 同口径）
+  与 `calendar=display` 剂量（与 `GET /dose?calendar=display` 同口径），
+  连同**收据链末端哈希**、未作废读数指纹、来源优先级配置指纹与日历指纹
+  一起固化快照（`snapshot`），并以其稳定规范序列化的 SHA-256 作为
+  **`digest`** 返回。展品未配置展陈日历时无法核算 `calendar=display`
+  剂量，创建直接 **409**；
+- **快照不可变**：`snapshot` 与 `digest` 落库后绝不改写；相同
+  `request_key` 且目标（规范档案 / 时间窗 / 诊断阈值）一致时重放首次创建
+  的原件（`already_committed=true`），换目标 → **409**；
+- **结案核对**：处置单只能从 `open` 结案为 `resolved` 或 `accepted`。
+  结案提交 `expected_digest`、决定与说明；服务在写事务内**重算当前摘要**，
+  读数、作废、来源优先级、日历或收据链的任何变化都会使摘要不同 →
+  **409 且不写入**。结案前先 `GET /illumination-tickets/{ticket_id}` 取回
+  实时重算的 `current_digest` 作为 `expected_digest`；
+- **resolved 举证**：须给出涉及的存证收据（`receipt_ids`）或批次更正
+  （`correction_request_keys`）至少一项（须属于本规范档案，否则 422），
+  并证明重算后**原诊断事件全部消失**且 `calendar=display` 剂量**未越限**，
+  否则 **409**；**accepted** 保留事件，只在 `note` 中记录理由（不接受
+  证据引用）。已结案的处置单不能再次结案（409）。
+
+### 21. 创建处置单
+
+```bash
+curl -s -X POST http://localhost:8000/exhibits/<id>/illumination-tickets \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "start": "2026-09-20T08:00:00Z",
+    "end":   "2026-09-20T18:00:00Z",
+    "max_rate_lux_per_second": 1.0,
+    "stuck_tolerance_lux": 2.0,
+    "min_stuck_seconds": 1800,
+    "request_key": "ticket-2026-09-20-stuck-01"
+  }'
+```
+
+```json
+{
+  "ticket_id": "7f3a…", "request_key": "ticket-2026-09-20-stuck-01",
+  "requested_id": "...", "canonical_id": "...",
+  "start": "2026-09-20T08:00:00Z", "end": "2026-09-20T18:00:00Z",
+  "max_rate_lux_per_second": 1.0, "stuck_tolerance_lux": 2.0,
+  "min_stuck_seconds": 1800.0,
+  "status": "open",
+  "digest": "b3c1…",
+  "snapshot": {
+    "canonical_id": "...",
+    "window": {"start": "2026-09-20T08:00:00Z", "end": "2026-09-20T18:00:00Z"},
+    "max_interval_seconds": 3600.0,
+    "thresholds": {"max_rate_lux_per_second": 1.0,
+                   "stuck_tolerance_lux": 2.0, "min_stuck_seconds": 1800.0},
+    "events": [
+      {"type": "stuck",
+       "start": "2026-09-20T08:00:00Z", "end": "2026-09-20T11:00:00Z",
+       "reading_ids": ["r1", "r2", "r3", "r4"],
+       "duration_seconds": 10800.0, "lux_span": 2.0}
+    ],
+    "dose": {"dose_limit_luxh": 150.0, "known_dose_luxh": 300.0,
+             "remaining_luxh": -150.0, "exceeded": true,
+             "first_exceeded_at": "2026-09-20T09:30:00Z",
+             "unknown_seconds": 25200.0, "covered_seconds": 10800.0,
+             "closed_seconds": 0.0, "reading_count": 4},
+    "receipt_chain": {"chain_id": "...", "seq": 3, "chain_hash": "b91a…"},
+    "readings_fingerprint": "…", "source_priority_fingerprint": "…",
+    "calendar_fingerprint": "…"
+  },
+  "created_at": "2026-09-21T02:00:00.000Z",
+  "decision": null, "closed_at": null, "close_note": null,
+  "evidence": null, "closed_digest": null, "current_digest": null,
+  "already_committed": false
+}
+```
+
+- 相同 `request_key` 重放（目标一致）→ 返回首次创建的原件
+  （`already_committed=true`），即使库内读数已变化，快照仍是首次固化的
+  内容；相同 `request_key` 换展品 / 时间窗 / 诊断阈值 → **409**；
+- 并发创建相同 `request_key`：只固化一张处置单，竞争方全部回放。
+
+### 22. 取回处置单与当前摘要
+
+```bash
+# open 状态的处置单附带 current_digest：按当前库内状态实时重算的摘要
+curl -s http://localhost:8000/illumination-tickets/7f3a…
+# {"ticket_id": "7f3a…", "status": "open", "digest": "b3c1…",
+#  "current_digest": "b3c1…", ...}        # 无变化时与 digest 相同
+
+# 列出某件展品的全部处置单（别名自动解析到规范档案）
+curl -s http://localhost:8000/exhibits/<id>/illumination-tickets
+```
+
+处置（如作废异常批次）会改变读数集合，`current_digest` 随之变化——结案
+前必须重新 GET 取回最新的 `current_digest`；日历被删除等导致无法重算时
+`current_digest` 为 `null`（结案同样 409）。
+
+### 23. 结案为 resolved（举证）
+
+```bash
+# 1) 处置：作废产生 stuck 事件的批次（见「照度上报批次更正」）
+curl -s -X POST http://localhost:8000/exhibits/<id>/receipts/corrections \
+  -H 'Content-Type: application/json' \
+  -d '{"receipt_id": "9c4f…", "request_key": "fix-2026-09-20-stuck",
+       "reason": "传感器卡死批次作废"}'
+
+# 2) 取回当前摘要（作废已改变读数集合，创建时的 digest 已失效）
+curl -s http://localhost:8000/illumination-tickets/7f3a…
+# {"...": "...", "current_digest": "e7d2…"}
+
+# 3) 结案：引用涉及的更正 request_key（或收据 receipt_id），
+#    服务重算证明原 stuck 事件消失且 calendar=display 剂量未越限
+curl -s -X POST http://localhost:8000/illumination-tickets/7f3a…/close \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "expected_digest": "e7d2…",
+    "decision": "resolved",
+    "note": "卡死批次已作废，时间线重算正常",
+    "correction_request_keys": ["fix-2026-09-20-stuck"]
+  }'
+```
+
+```json
+{
+  "ticket_id": "7f3a…", "status": "resolved", "decision": "resolved",
+  "digest": "b3c1…", "closed_digest": "e7d2…",
+  "close_note": "卡死批次已作废，时间线重算正常",
+  "evidence": {"receipt_ids": [],
+               "correction_request_keys": ["fix-2026-09-20-stuck"]},
+  "events_cleared": true, "dose_exceeded": false,
+  "closed_at": "2026-09-21T03:00:00.000Z",
+  "snapshot": {"...": "（与创建时完全一致，原 stuck 事件仍固化其中）"}
+}
+```
+
+`resolved` 举证规则：
+
+- `receipt_ids` / `correction_request_keys` 至少一项，且必须属于本规范
+  档案（收据在本档案链上、更正属于本档案），否则 **422**；
+- 重算后**原诊断事件须全部消失**（快照 `events` 中的每个事件都不再出现
+  于当前重算结果），且 `calendar=display` 剂量**未越限**，否则 **409**
+  且不写入；响应的 `events_cleared` / `dose_exceeded` 即这两项证明。
+
+### 24. 结案为 accepted（保留事件）
+
+```bash
+curl -s -X POST http://localhost:8000/illumination-tickets/7f3a…/close \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "expected_digest": "b3c1…",
+    "decision": "accepted",
+    "note": "夜间红外补光导致照度平稳段，属展陈正常工况，保留事件"
+  }'
+# {"ticket_id": "7f3a…", "status": "accepted", "events_cleared": null,
+#  "dose_exceeded": null, "evidence": null, ...}
+```
+
+`accepted` 保留事件、只在 `note` 中记录理由，不接受收据/更正引用
+（携带 `receipt_ids` 或 `correction_request_keys` → **422**）。
+
+### 25. 摘要核对失败与错误码
+
+结案时服务在写事务内重算当前摘要并与 `expected_digest` 比对，**不一致则
+409 且不写入**（处置单保持 `open`）：
+
+```bash
+# 创建后又上报了新读数（读数集合与收据链末端都变化）
+curl -i -X POST http://localhost:8000/illumination-tickets/7f3a…/close \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_digest": "b3c1…", "decision": "accepted", "note": "x"}'
+# HTTP/1.1 409 Conflict
+# {"detail": "处置单摘要核对失败：读数、作废、来源优先级、日历或收据链已变化
+#  （期望 b3c1…，当前重算 e7d2…），结案未写入；请重新 GET 取回 current_digest 后重试"}
+```
+
+会使摘要变化的操作：新上报读数（读数集合 + 收据链末端）、批次更正作废
+（读数集合）、发布来源优先级版本（配置指纹，可能改变权威时间线）、修改或
+删除展陈日历（日历指纹 + `calendar=display` 剂量）、档案归并（链标识 /
+读数归属 / 日历归属变化）。
+
+错误码小结：展品不存在 → 404；处置单不存在 → 404；`end` 不晚于 `start`
+或未配置展陈日历 → 422 / 409（创建）；`request_key` 换目标 → 409；已结案
+再次结案 → 409；摘要核对失败 / resolved 证明失败 → 409；resolved 缺少证据
+或证据不属于本档案、accepted 携带证据 → 422。
+
 ## 核算语义
 
 - **梯形法**：相邻两条权威读数之间照度按线性变化处理，
@@ -1314,8 +1515,9 @@ uvicorn app.main:app --reload  # 本地起服务，默认 http://127.0.0.1:8000
 │   ├── evacuation.py # 应急撤离编排：时变最早到达搜索、[进入,离开) 半开容量计数、封闭等待/绕行、路径字典序决胜（纯只读）
 │   ├── receipts.py  # 照度上报存证：收据规范序列化、SHA-256 链哈希、整链校验
 │   ├── corrections.py # 上报批次更正：作废收据中实际插入的读数、request_key 幂等、前置变化整次 409
+│   ├── tickets.py   # 照度异常处置单：创建时单事务重算诊断/剂量/链尾并固化快照，结案重算核对（409 不写入）、resolved 举证
 │   ├── snapshots.py # SQLite 在线快照：backup 热备、临时文件 + SHA-256 清单 + 原子重命名、只读校验
-│   ├── db.py        # SQLite 连接与建表（exhibits / readings / ingest_receipts / exhibit_aliases / merge_previews / 日历四表 / inventory_rounds / reading_corrections / source_priority_versions）
+│   ├── db.py        # SQLite 连接与建表（exhibits / readings / ingest_receipts / exhibit_aliases / merge_previews / 日历四表 / inventory_rounds / reading_corrections / source_priority_versions / illumination_tickets）
 │   └── schemas.py   # Pydantic 请求/响应模型
 ├── tests/
 │   ├── test_api.py       # 剂量核算与归并
@@ -1326,6 +1528,7 @@ uvicorn app.main:app --reload  # 本地起服务，默认 http://127.0.0.1:8000
 │   ├── test_corrections.py # 上报批次更正：仅作废 inserted、重放/换目标 409、链/归并/归属变化 409、查询排除
 │   ├── test_inventory.py # RFID 盘点对账：窗口定位、四类差异、别名解析、摘要重放/409、并发固化、隔离性
 │   ├── test_evacuation.py # 应急撤离：容量竞争、半开封闭等待/绕行、路径字典序平局、别名重复 422、无出口 422、只读隔离
+│   ├── test_tickets.py   # 照度异常处置单：快照固化与 digest、request_key 重放/换目标 409、结案核对 409、resolved 举证、并发
 │   └── test_snapshots.py # 在线快照：事务一致副本、409 并发、原子发布、下载、只读校验与防篡改
 ├── requirements.txt         # 运行时依赖（含 tzdata，保证容器内 IANA 时区数据库可用）
 ├── requirements-dev.txt     # 测试依赖

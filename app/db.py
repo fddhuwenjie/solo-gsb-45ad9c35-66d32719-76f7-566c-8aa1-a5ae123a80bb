@@ -157,6 +157,36 @@ CREATE TABLE IF NOT EXISTS reading_corrections (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_reading_corrections_receipt
 ON reading_corrections (chain_id, seq);
 
+-- 照度异常处置单：创建时在单个事务内按未作废权威时间线重算诊断事件与
+-- calendar=display 剂量，连同收据链末端哈希、未作废读数指纹、来源优先级
+-- 配置指纹与日历指纹一起固化快照（snapshot_json），digest 为其规范序列化
+-- 的 SHA-256。快照只增不改：snapshot_json 与 digest 落库后绝不 UPDATE，
+-- 结案只写结案列（closed_at/decision/close_note/evidence_json/closed_digest）。
+-- request_key 为创建幂等键：同键同目标重放首次结果，换目标 → 409。
+-- 与 ingest_receipts 一样故意不设外键、不级联删除：档案归并后处置单
+-- 连同其快照原样保留供事后核查。
+CREATE TABLE IF NOT EXISTS illumination_tickets (
+    ticket_id               TEXT PRIMARY KEY,
+    request_key             TEXT NOT NULL UNIQUE,  -- 创建幂等键
+    canonical_id            TEXT NOT NULL,         -- 创建时解析出的规范档案 ID
+    requested_id            TEXT NOT NULL,         -- 请求中使用的展品 ID（可能是别名）
+    start_s                 REAL NOT NULL,         -- 处置窗口起点，Unix 秒（UTC）
+    end_s                   REAL NOT NULL,         -- 处置窗口终点，Unix 秒（UTC）
+    max_rate_lux_per_second REAL NOT NULL,         -- 诊断阈值：突变速率上限（lux/秒）
+    stuck_tolerance_lux     REAL NOT NULL,         -- 诊断阈值：卡死容差（lux）
+    min_stuck_seconds       REAL NOT NULL,         -- 诊断阈值：卡死最短持续（秒）
+    digest                  TEXT NOT NULL,         -- 固化快照摘要 SHA-256（不可变）
+    snapshot_json           TEXT NOT NULL,         -- 固化快照（事件+剂量+指纹+链尾）
+    status                  TEXT NOT NULL DEFAULT 'open'
+                            CHECK (status IN ('open', 'resolved', 'accepted')),
+    created_at              TEXT NOT NULL,
+    closed_at               TEXT,                  -- 结案时刻（UTC ISO）
+    decision                TEXT,                  -- 结案决定：resolved | accepted
+    close_note              TEXT,                  -- 结案说明；accepted 时即保留事件的理由
+    evidence_json           TEXT,                  -- resolved 的收据/更正 request_key 引用
+    closed_digest           TEXT                   -- 结案时重算核对的摘要
+);
+
 -- 多来源读数仲裁：来源优先级版本。每版携带生效时刻 effective_at 与来源
 -- 优先级列表（JSON 数组，靠前优先级更高；未列入的来源并列最低）。
 -- 版本只增不改：配置更新必须携带 expected_version（当前最新版本号），

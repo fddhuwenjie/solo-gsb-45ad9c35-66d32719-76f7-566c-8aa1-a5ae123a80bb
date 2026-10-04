@@ -905,3 +905,164 @@ class EvacuationResponse(BaseModel):
     total_completion_offset_seconds: int = Field(
         description="全部展品撤离完成的总完成时间（最晚一件到达出口的相对秒）",
     )
+
+
+# ---------- 照度异常处置单 ----------
+
+class IlluminationTicketCreate(BaseModel):
+    """创建照度异常处置单：处置时间窗 + 诊断阈值 + 创建幂等键。"""
+
+    start: datetime = Field(description="处置窗口起点（含），ISO 8601；缺省时区按 UTC 处理")
+    end: datetime = Field(description="处置窗口终点（含），ISO 8601；缺省时区按 UTC 处理")
+    max_rate_lux_per_second: float = Field(
+        gt=0, description="照度最大允许变化速率（lux/秒），与诊断接口同口径",
+    )
+    stuck_tolerance_lux: float = Field(
+        ge=0, description="卡死容差（lux），与诊断接口同口径",
+    )
+    min_stuck_seconds: float = Field(
+        gt=0, description="卡死事件最短持续时长（秒），与诊断接口同口径",
+    )
+    request_key: str = Field(
+        min_length=1, max_length=200,
+        description="创建幂等键：相同 request_key 且目标一致重放首次结果；换目标 → 409",
+    )
+
+    @field_validator("start", "end")
+    @classmethod
+    def _aware(cls, v: datetime) -> datetime:
+        return ensure_aware(v)
+
+
+class TicketWindowOut(BaseModel):
+    start: str
+    end: str
+
+
+class TicketThresholdsOut(BaseModel):
+    max_rate_lux_per_second: float
+    stuck_tolerance_lux: float
+    min_stuck_seconds: float
+
+
+class TicketDoseOut(BaseModel):
+    """快照中按 calendar=display 口径重算的剂量。"""
+
+    dose_limit_luxh: float
+    known_dose_luxh: float = Field(description="窗口内已知剂量（lux·h）")
+    remaining_luxh: float = Field(description="截至窗口末、按开放历史累计的剩余额度（lux·h）")
+    exceeded: bool = Field(description="截至窗口末开放历史累计是否已越线")
+    first_exceeded_at: str | None = Field(description="全历史首次越线时刻；未越线为 null")
+    unknown_seconds: float
+    covered_seconds: float
+    closed_seconds: float = Field(description="窗口内闭馆时长（秒）")
+    reading_count: int
+
+
+class TicketChainTailOut(BaseModel):
+    """固化时点的存证收据链末端。"""
+
+    chain_id: str = Field(description="链标识，即规范档案 ID")
+    seq: int = Field(description="末端收据序号；链为空为 0")
+    chain_hash: str = Field(description="末端收据链哈希；链为空为 64 个 0（创世衔接值）")
+
+
+class TicketSnapshotOut(BaseModel):
+    """处置单创建时固化的快照（不可变）；digest 即对本对象规范序列化的 SHA-256。"""
+
+    canonical_id: str
+    window: TicketWindowOut
+    max_interval_seconds: float
+    thresholds: TicketThresholdsOut
+    events: list[DiagnosisEventOut] = Field(
+        description="按未作废权威时间线重算、与处置窗口相交的诊断事件（与诊断接口同口径）",
+    )
+    dose: TicketDoseOut = Field(description="calendar=display 口径重算的剂量")
+    receipt_chain: TicketChainTailOut = Field(description="收据链末端哈希")
+    readings_fingerprint: str = Field(description="未作废读数集合指纹：读数或作废变化即变")
+    source_priority_fingerprint: str = Field(description="来源优先级版本配置指纹")
+    calendar_fingerprint: str = Field(description="展陈开放日历配置指纹")
+
+
+class TicketEvidenceOut(BaseModel):
+    """resolved 结案时登记的涉及收据 / 批次更正引用。"""
+
+    receipt_ids: list[str] = Field(description="涉及的存证收据 receipt_id（本规范档案链上）")
+    correction_request_keys: list[str] = Field(description="涉及的批次更正 request_key（本规范档案）")
+
+
+class IlluminationTicketOut(BaseModel):
+    ticket_id: str
+    request_key: str = Field(description="创建幂等键")
+    requested_id: str = Field(description="创建请求中使用的展品 ID（可能是别名）")
+    canonical_id: str = Field(description="创建时解析出的规范档案 ID")
+    start: str = Field(description="处置窗口起点（UTC，ISO 8601，Z 结尾）")
+    end: str = Field(description="处置窗口终点（UTC，ISO 8601，Z 结尾）")
+    max_rate_lux_per_second: float
+    stuck_tolerance_lux: float
+    min_stuck_seconds: float
+    status: Literal["open", "resolved", "accepted"] = Field(
+        description="处置单状态：只能从 open 结案为 resolved 或 accepted",
+    )
+    digest: str = Field(description="创建时固化快照的摘要（SHA-256），不可变")
+    snapshot: TicketSnapshotOut = Field(description="创建时固化的快照，落库后绝不改写")
+    created_at: str
+    decision: Literal["resolved", "accepted"] | None = Field(default=None, description="结案决定")
+    closed_at: str | None = Field(default=None, description="结案时刻（UTC，ISO 8601，Z 结尾）")
+    close_note: str | None = Field(default=None, description="结案说明；accepted 时即保留事件的理由")
+    evidence: TicketEvidenceOut | None = Field(
+        default=None, description="resolved 结案登记的涉及收据 / 批次更正引用",
+    )
+    closed_digest: str | None = Field(
+        default=None,
+        description="结案时重算核对的摘要；与结案请求 expected_digest 一致才允许结案",
+    )
+    current_digest: str | None = Field(
+        default=None,
+        description="仅 GET 单张且状态为 open 时返回：按当前状态实时重算的摘要，"
+                    "用作结案的 expected_digest；无法重算（如日历已删除）为 null",
+    )
+    already_committed: bool = Field(
+        default=False,
+        description="true 表示相同 request_key 重放，返回的是首次创建的原件",
+    )
+
+
+class IlluminationTicketListOut(BaseModel):
+    requested_id: str
+    canonical_id: str
+    tickets: list[IlluminationTicketOut]
+
+
+class IlluminationTicketCloseRequest(BaseModel):
+    """结案请求：只能从 open 结案为 resolved 或 accepted。"""
+
+    expected_digest: str = Field(
+        min_length=1, max_length=64,
+        description="结案时核对的摘要：须与服务端当前重算结果一致，"
+                    "读数/作废/来源优先级/日历/收据链变化导致不一致 → 409 不写入",
+    )
+    decision: Literal["resolved", "accepted"] = Field(
+        description="resolved：异常已处置（须举证）；accepted：保留事件并记录理由",
+    )
+    note: str = Field(min_length=1, max_length=2000,
+                      description="结案说明；accepted 时即保留事件的理由")
+    receipt_ids: list[Annotated[str, Field(min_length=1, max_length=200)]] = Field(
+        default_factory=list, max_length=1000,
+        description="resolved 必填其一：涉及的存证收据 receipt_id（须属于本规范档案的收据链）",
+    )
+    correction_request_keys: list[Annotated[str, Field(min_length=1, max_length=200)]] = Field(
+        default_factory=list, max_length=1000,
+        description="resolved 必填其一：涉及的批次更正 request_key（须属于本规范档案）",
+    )
+
+
+class IlluminationTicketCloseOut(IlluminationTicketOut):
+    events_cleared: bool | None = Field(
+        default=None,
+        description="resolved 结案证明：重算后原诊断事件是否全部消失（结案要求为 true）",
+    )
+    dose_exceeded: bool | None = Field(
+        default=None,
+        description="resolved 结案证明：重算后 calendar=display 剂量是否越限（结案要求为 false）",
+    )
