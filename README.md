@@ -56,6 +56,14 @@
   创建 / 列表 / 下载，并可在独立只读连接上核对哈希、执行
   `integrity_check` 与 `foreign_key_check`；并发创建只允许一个，其余 409，
   失败或未完成的文件绝不出现在列表中。
+- 支持**照度异常处置单**：创建时在**一个 SQLite 事务**内按未作废权威时间线
+  重算诊断事件与 `calendar=display` 剂量，连同**收据链末端哈希**固化为
+  不可变快照并返回摘要 `digest`（`request_key` 幂等，重放原结果、换目标
+  409）；处置单只能从 `open` 结案为 `resolved` 或 `accepted`——提交
+  `expected_digest`、决定与说明，读数 / 作废 / 来源优先级 / 日历 / 收据链
+  变化导致摘要不同则 **409 且不写入**；`resolved` 须给出涉及的收据或更正
+  `request_key` 佐证，并证明重算后原事件全部消失、剂量未越限，`accepted`
+  保留事件并记录理由。
 
 ## 快速开始（Docker Compose 一键启动）
 
@@ -107,6 +115,10 @@ SQLite 数据文件存放在命名卷 `lightdose-data`（容器内 `/data/lightd
 | GET | `/snapshots/{seq}` | 查询单个快照清单（编号 / 时间 / 页数 / 字节数 / SHA-256） |
 | GET | `/snapshots/{seq}/download` | 下载快照数据库文件（单一自包含 `.db`） |
 | GET | `/snapshots/{seq}/verify` | 只读校验快照：哈希 + `integrity_check` + `foreign_key_check` |
+| POST | `/exhibits/{id}/anomaly-tickets` | 创建照度异常处置单：单事务重算诊断事件 + `calendar=display` 剂量 + 收据链末端，固化快照并返回 `digest`（`request_key` 幂等） |
+| GET | `/exhibits/{id}/anomaly-tickets` | 列出规范档案的全部处置单（别名自动解析） |
+| GET | `/exhibits/{id}/anomaly-tickets/{ticket_id}` | 查询单张处置单：固化快照 + 当前实时摘要 `current_digest` / `digest_stale` |
+| POST | `/exhibits/{id}/anomaly-tickets/{ticket_id}/close` | 结案（仅 open → resolved / accepted）：`expected_digest` 核对当前摘要，不符 409 不写入；resolved 须佐证 + 重算证明 |
 
 > **请求 ID 与规范 ID**：所有档案相关响应都同时返回 `requested_id`（请求中
 > 使用的 ID）与 `canonical_id`（实际档案 ID）。档案未归并时两者相同；归并后用
@@ -835,6 +847,190 @@ curl -s -X POST http://localhost:8000/exhibits/<id>/receipts/corrections \
 > 同数据重新上报记为 `duplicate`（读数保持作废态，不会“复活”），同 ID
 > 不同数据记为 `conflict`；需要以新读数替换时请使用新的读数 ID。
 
+## 照度异常处置单
+
+诊断发现缺测 / 突变 / 卡死 / 时间冲突等异常后，可开立**照度异常处置单**
+跟踪处置全过程：创建时把当时的异常状况固化为**不可变快照**并返回摘要
+`digest`；处置完成后结案，结案时服务重算当前状态并与 `expected_digest`
+核对，任何底层变化都会使结案失败（409），保证结案依据与创建时的快照
+严格对应。
+
+### 创建：单事务固化快照
+
+`POST /exhibits/{id}/anomaly-tickets`（展品 ID 可用归并别名）：
+
+| 字段 | 含义 |
+|---|---|
+| `start` / `end` | 时间窗（含端点，ISO 8601，缺省时区按 UTC；`end` 必须晚于 `start`） |
+| `max_rate_lux_per_second` / `stuck_tolerance_lux` / `min_stuck_seconds` | 诊断阈值（与诊断接口同义，创建时固化） |
+| `request_key` | 创建幂等键：相同请求（规范档案 / 时间窗 / 诊断阈值一致）重放首次结果；换目标 → 409 |
+
+创建在**一个 SQLite 事务**（`BEGIN IMMEDIATE`）内完成：
+
+1. 按**未作废权威时间线**重算诊断事件（gap / jump / stuck /
+   timestamp_conflict，与诊断接口同口径：完整时间线形成、窗口相交筛选，
+   已配置来源优先级时先仲裁）；
+2. 重算同一时间窗的 **`calendar=display` 剂量**（未配置展陈开放日历 →
+   **409**，与剂量查询一致）；
+3. 读取**收据链末端**（链标识、末张序号、末张链哈希；空链记为序号 0、
+   64 个 `0` 的创世衔接值）；
+4. 三者连同规范档案、时间窗与阈值按稳定规范序列化取 SHA-256 得到
+   `digest`，快照与摘要随处置单落库，**绝不改写**。
+
+### 21. 创建一张处置单
+
+假设 `EX-001` 已登记（上限 150 lux·h、最大采样间隔 3600 秒）、配置了
+`Asia/Shanghai` 每天 09:00–17:00 的开放日历，并分三批上报了读数：
+`r1`（01:00，100 lux）、`r2`（01:10，900 lux，异常尖峰，单独一批）、
+`r3`（01:20，100 lux）。诊断发现两个 jump 事件，开立处置单：
+
+```bash
+curl -s -X POST http://localhost:8000/exhibits/EX-001/anomaly-tickets \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "start": "2026-09-21T00:00:00Z",
+    "end":   "2026-09-21T08:00:00Z",
+    "max_rate_lux_per_second": 1.0,
+    "stuck_tolerance_lux": 2.0,
+    "min_stuck_seconds": 1800,
+    "request_key": "ANOM-2026-09-21-01"
+  }'
+```
+
+```json
+{
+  "ticket_id": "7c1e…", "request_key": "ANOM-2026-09-21-01",
+  "requested_id": "EX-001", "canonical_id": "EX-001",
+  "status": "open",
+  "start": "2026-09-21T00:00:00Z", "end": "2026-09-21T08:00:00Z",
+  "max_interval_seconds": 3600.0, "dose_limit_luxh": 150.0,
+  "max_rate_lux_per_second": 1.0, "stuck_tolerance_lux": 2.0,
+  "min_stuck_seconds": 1800.0,
+  "digest": "2d3ebf2c…",
+  "snapshot": {
+    "events": [
+      {"type": "jump", "start": "2026-09-21T01:00:00Z",
+       "end": "2026-09-21T01:10:00Z", "reading_ids": ["r1", "r2"],
+       "interval_seconds": 600.0, "rate_lux_per_second": 1.333333,
+       "duration_seconds": null, "lux_span": null},
+      {"type": "jump", "start": "2026-09-21T01:10:00Z",
+       "end": "2026-09-21T01:20:00Z", "reading_ids": ["r2", "r3"],
+       "interval_seconds": 600.0, "rate_lux_per_second": 1.333333,
+       "duration_seconds": null, "lux_span": null}
+    ],
+    "dose": {"known_dose_luxh": 166.666667, "remaining_luxh": -16.666667,
+             "exceeded": true, "first_exceeded_at": "2026-09-21T01:16:05.767078Z",
+             "unknown_seconds": 24000.0, "covered_seconds": 1200.0,
+             "closed_seconds": 3600.0, "reading_count": 3},
+    "receipt_chain_tail": {"chain_id": "EX-001", "seq": 3, "chain_hash": "b91a…"}
+  },
+  "created_at": "2026-09-21T09:00:00.000Z",
+  "closed_at": null, "closure": null,
+  "already_committed": false
+}
+```
+
+相同 `request_key` 重放同一请求返回首次结果（`already_committed=true`，
+`ticket_id` / `digest` / 创建时刻不变）；同 `request_key` 换档案、时间窗
+或诊断阈值 → **409**。摘要覆盖：规范档案、时间窗、诊断阈值（含展品上限与
+最大采样间隔）、重算的事件与剂量、收据链末端——因此**读数、作废、来源
+优先级、日历、收据链**任一变化都会改变重算摘要。
+
+### 结案前：查询当前摘要
+
+`GET /exhibits/{id}/anomaly-tickets/{ticket_id}` 返回固化快照（不变），并附
+按当前数据实时重算的 `current_digest` 与 `digest_stale`（日历被删除等无法
+重算时 `current_digest` 为 `null`、`digest_stale=true`）。结案应以
+`current_digest` 作为 `expected_digest` 提交。列表接口
+`GET /exhibits/{id}/anomaly-tickets` 返回全部处置单的固化视图。
+
+### 22. 结案：resolved（处置完成）
+
+结案接口 `POST /exhibits/{id}/anomaly-tickets/{ticket_id}/close`，请求字段：
+
+| 字段 | 含义 |
+|---|---|
+| `expected_digest` | 期望的当前摘要：服务重算后不一致 → **409 且不写入** |
+| `decision` | `resolved`（异常已处置）或 `accepted`（接受现状） |
+| `note` | 结案说明（处置说明 / 接受理由） |
+| `evidence` | **resolved 必填**：`receipt_ids` 与/或 `correction_request_keys`——涉及的收据或更正，须存在且属于该规范档案（不存在 404、属于他档 409） |
+
+`resolved` 的重算证明（在结案事务内核对）：
+
+- 快照中的**原诊断事件全部消失**（以完整事件记录比对；处置后新出现的
+  事件不影响判定，可另开新单跟踪）；
+- `calendar=display` 剂量**未越限**（`exceeded=false`）。
+
+```bash
+# 1) 先用批次更正作废异常批次（r2 为接线错误尖峰）
+curl -s -X POST http://localhost:8000/exhibits/EX-001/receipts/corrections \
+  -H 'Content-Type: application/json' \
+  -d '{"receipt_id": "9c4f…", "request_key": "fix-2026-09-21-r2",
+       "reason": "r2 为接线错误尖峰，批次作废"}'
+
+# 2) 取当前摘要（作废后摘要已变化，用创建时的 digest 结案会 409）
+curl -s http://localhost:8000/exhibits/EX-001/anomaly-tickets/7c1e…
+# {"digest": "2d3ebf2c…", "current_digest": "a07f11d9…", "digest_stale": true, ...}
+
+# 3) 以当前摘要结案
+curl -s -X POST http://localhost:8000/exhibits/EX-001/anomaly-tickets/7c1e…/close \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "expected_digest": "a07f11d9…",
+    "decision": "resolved",
+    "note": "故障批次已作废，时间线恢复正常",
+    "evidence": {"receipt_ids": ["9c4f…"],
+                 "correction_request_keys": ["fix-2026-09-21-r2"]}
+  }'
+```
+
+```json
+{
+  "ticket_id": "7c1e…", "status": "resolved",
+  "digest": "2d3ebf2c…",
+  "snapshot": {"events": ["…仍为创建时的两个 jump 事件，快照不可变…"]},
+  "closed_at": "2026-09-21T10:00:00.000Z",
+  "closure": {
+    "decision": "resolved",
+    "note": "故障批次已作废，时间线恢复正常",
+    "expected_digest": "a07f11d9…",
+    "evidence": {"receipt_ids": ["9c4f…"],
+                 "correction_request_keys": ["fix-2026-09-21-r2"]},
+    "events_kept": null,
+    "proof": {"original_events_cleared": true, "dose_exceeded_after": false,
+              "events_before": 2, "events_after": 0},
+    "closed_at": "2026-09-21T10:00:00.000Z"
+  }
+}
+```
+
+### 23. 结案：accepted（接受现状）
+
+`accepted` 保留事件、只记录理由，无需佐证与证明；`events_kept` 记录结案时
+仍在的事件数：
+
+```bash
+curl -s -X POST http://localhost:8000/exhibits/EX-001/anomaly-tickets/7c1e…/close \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_digest": "2d3ebf2c…", "decision": "accepted",
+       "note": "尖峰为临时布展灯光，风险已评估接受"}'
+# closure: {"decision": "accepted", "events_kept": 2, "proof": null, "evidence": null, ...}
+```
+
+### 结案规则小结
+
+- 处置单**只能从 `open` 结案**；已结案（`resolved` / `accepted`）再次结案
+  → **409**；并发结案只有一个成功；
+- 摘要核对在写事务内进行：`expected_digest` 与当前重算结果不一致（读数 /
+  作废 / 来源优先级 / 日历 / 收据链已变化）→ **409 且不写入任何结案记录**，
+  响应 `detail` 附带当前摘要；
+- `resolved` 缺佐证 → **422**；佐证收据 / 更正不存在 → **404**，属于其他
+  档案 → **409**；原事件未全部消失或剂量仍越限 → **409**；
+- 结案只写状态与结案记录：**创建时固化的快照与 `digest` 永不变**，处置单
+  不随档案归并改写（归并删除档案后处置单连同快照原样保留备查）；
+- 处置单接口与其他接口一样先做**别名解析**：创建、列表、查询、结案均可
+  使用归并别名，响应同时给出 `requested_id` 与 `canonical_id`。
+
 ## 核算语义
 
 - **梯形法**：相邻两条权威读数之间照度按线性变化处理，
@@ -1304,7 +1500,7 @@ uvicorn app.main:app --reload  # 本地起服务，默认 http://127.0.0.1:8000
 
 ```
 ├── app/
-│   ├── main.py      # FastAPI 路由：展品 / 读数 / 存证收据 / 剂量查询 / 采集质量诊断 / 展陈日历 / 档案归并 / 来源优先级 / 权威时间线
+│   ├── main.py      # FastAPI 路由：展品 / 读数 / 存证收据 / 剂量查询 / 采集质量诊断 / 展陈日历 / 档案归并 / 来源优先级 / 权威时间线 / 异常处置单
 │   ├── dose.py      # 核算核心：梯形法、缺测段、首次越线求解、开放区间裁剪
 │   ├── diagnose.py  # 采集质量诊断：同值合并 / 时间冲突 / gap / jump / 最大 stuck、完整时间线与窗口筛选
 │   ├── arbitration.py # 多来源读数仲裁：来源优先级版本、逐时刻权威值选取、并列冲突、诊断输入展开
@@ -1314,8 +1510,9 @@ uvicorn app.main:app --reload  # 本地起服务，默认 http://127.0.0.1:8000
 │   ├── evacuation.py # 应急撤离编排：时变最早到达搜索、[进入,离开) 半开容量计数、封闭等待/绕行、路径字典序决胜（纯只读）
 │   ├── receipts.py  # 照度上报存证：收据规范序列化、SHA-256 链哈希、整链校验
 │   ├── corrections.py # 上报批次更正：作废收据中实际插入的读数、request_key 幂等、前置变化整次 409
+│   ├── tickets.py   # 照度异常处置单：单事务固化快照（诊断事件 + calendar=display 剂量 + 收据链末端）、digest 核对、resolved/accepted 结案
 │   ├── snapshots.py # SQLite 在线快照：backup 热备、临时文件 + SHA-256 清单 + 原子重命名、只读校验
-│   ├── db.py        # SQLite 连接与建表（exhibits / readings / ingest_receipts / exhibit_aliases / merge_previews / 日历四表 / inventory_rounds / reading_corrections / source_priority_versions）
+│   ├── db.py        # SQLite 连接与建表（exhibits / readings / ingest_receipts / exhibit_aliases / merge_previews / 日历四表 / inventory_rounds / reading_corrections / source_priority_versions / anomaly_tickets）
 │   └── schemas.py   # Pydantic 请求/响应模型
 ├── tests/
 │   ├── test_api.py       # 剂量核算与归并
@@ -1326,6 +1523,7 @@ uvicorn app.main:app --reload  # 本地起服务，默认 http://127.0.0.1:8000
 │   ├── test_corrections.py # 上报批次更正：仅作废 inserted、重放/换目标 409、链/归并/归属变化 409、查询排除
 │   ├── test_inventory.py # RFID 盘点对账：窗口定位、四类差异、别名解析、摘要重放/409、并发固化、隔离性
 │   ├── test_evacuation.py # 应急撤离：容量竞争、半开封闭等待/绕行、路径字典序平局、别名重复 422、无出口 422、只读隔离
+│   ├── test_tickets.py   # 照度异常处置单：快照固化与 digest、request_key 幂等、结案 409/证明、快照不可变
 │   └── test_snapshots.py # 在线快照：事务一致副本、409 并发、原子发布、下载、只读校验与防篡改
 ├── requirements.txt         # 运行时依赖（含 tzdata，保证容器内 IANA 时区数据库可用）
 ├── requirements-dev.txt     # 测试依赖

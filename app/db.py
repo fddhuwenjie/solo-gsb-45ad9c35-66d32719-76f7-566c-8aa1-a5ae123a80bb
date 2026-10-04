@@ -157,6 +157,35 @@ CREATE TABLE IF NOT EXISTS reading_corrections (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_reading_corrections_receipt
 ON reading_corrections (chain_id, seq);
 
+-- 照度异常处置单：创建时在单个事务内按未作废权威时间线重算诊断事件与
+-- calendar=display 剂量，连同收据链末端哈希固化为快照并计算 digest；
+-- 快照只增不改（snapshot_json / digest 绝不 UPDATE），结案只写
+-- status / closed_at / closure_json。request_key 为创建幂等键：
+-- 相同请求重放原结果，换目标（档案/时间窗/诊断阈值）→ 409。
+-- 与收据/更正一样故意不设外键、不级联删除：档案归并删除档案后，
+-- 处置单连同其快照原样保留供事后核查。
+CREATE TABLE IF NOT EXISTS anomaly_tickets (
+    ticket_id               TEXT PRIMARY KEY,
+    request_key             TEXT NOT NULL UNIQUE,  -- 创建幂等键
+    canonical_id            TEXT NOT NULL,         -- 创建时解析出的规范档案 ID
+    requested_id            TEXT NOT NULL,         -- 创建请求中使用的展品 ID（可能是别名）
+    start_ts                REAL NOT NULL,         -- 时间窗（Unix 秒，UTC）
+    end_ts                  REAL NOT NULL,
+    max_rate_lux_per_second REAL NOT NULL,         -- 诊断阈值（创建时固化）
+    stuck_tolerance_lux     REAL NOT NULL,
+    min_stuck_seconds       REAL NOT NULL,
+    digest                  TEXT NOT NULL,         -- 快照摘要 SHA-256
+    snapshot_json           TEXT NOT NULL,         -- 固化快照：事件 + 剂量 + 收据链末端
+    status                  TEXT NOT NULL DEFAULT 'open'
+                            CHECK (status IN ('open', 'resolved', 'accepted')),
+    created_at              TEXT NOT NULL,
+    closed_at               TEXT,
+    closure_json            TEXT                   -- 结案记录：决定/说明/佐证/证明
+);
+
+CREATE INDEX IF NOT EXISTS idx_anomaly_tickets_exhibit
+ON anomaly_tickets (canonical_id, created_at);
+
 -- 多来源读数仲裁：来源优先级版本。每版携带生效时刻 effective_at 与来源
 -- 优先级列表（JSON 数组，靠前优先级更高；未列入的来源并列最低）。
 -- 版本只增不改：配置更新必须携带 expected_version（当前最新版本号），

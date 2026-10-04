@@ -40,6 +40,12 @@ from .receipts import (
     verify_chain_rows,
 )
 from .schemas import (
+    AnomalyTicketCloseRequest,
+    AnomalyTicketCreateOut,
+    AnomalyTicketCreateRequest,
+    AnomalyTicketDetailOut,
+    AnomalyTicketListOut,
+    AnomalyTicketOut,
     CalendarConfigIn,
     CalendarExceptionDayOut,
     CalendarOut,
@@ -96,6 +102,7 @@ from .snapshots import (
     snapshot_db_path,
     verify_snapshot,
 )
+from .tickets import close_ticket, create_ticket, get_ticket, list_tickets
 
 
 @asynccontextmanager
@@ -108,7 +115,7 @@ async def lifespan(_: FastAPI) -> Iterator[None]:
 
 app = FastAPI(
     title="馆藏展品光照剂量核算 API",
-    version="1.9.0",
+    version="1.10.0",
     description="登记展品光照上限，接收乱序/补传照度读数，按梯形法累计 lux·h，缺测段不插值；"
                 "支持展陈开放日历（IANA 时区 + 每周时段 + 日期例外），剂量可按开放时段裁剪核算；"
                 "支持重复展品档案预演归并，来源 ID 归并后成为目标 ID 的永久别名；"
@@ -134,7 +141,13 @@ app = FastAPI(
                 "档案归并保留双方既有链、新上报继续接入目标原链；"
                 "支持可验证的 SQLite 在线快照（sqlite3 backup 事务一致副本、"
                 "临时文件 + SHA-256 清单 + 原子重命名发布、只读连接执行 "
-                "integrity_check / foreign_key_check 校验）。",
+                "integrity_check / foreign_key_check 校验）；"
+                "支持照度异常处置单：创建时在单个事务内按未作废权威时间线重算诊断事件与 "
+                "calendar=display 剂量，连同收据链末端哈希固化快照并返回 digest"
+                "（request_key 幂等，快照不可变）；结案只能从 open 到 resolved/accepted，"
+                "提交 expected_digest 核对当前摘要（读数/作废/来源优先级/日历/收据链"
+                "变化导致不符则 409 不写入），resolved 须给出收据或更正 request_key "
+                "佐证并证明重算后原事件消失、剂量未越限，accepted 保留事件并记录理由。",
     lifespan=lifespan,
 )
 
@@ -673,6 +686,80 @@ def diagnose_readings(
         min_stuck_seconds=round6(payload.min_stuck_seconds),
         events=events_out,
     )
+
+
+# ---------- 照度异常处置单（创建固化快照 / 结案核对摘要与证明） ----------
+
+@app.post("/exhibits/{exhibit_id}/anomaly-tickets",
+          response_model=AnomalyTicketCreateOut, tags=["tickets"])
+def create_anomaly_ticket(
+    exhibit_id: str,
+    payload: AnomalyTicketCreateRequest,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> AnomalyTicketCreateOut:
+    """创建照度异常处置单：固化诊断/剂量/收据链快照并返回 digest。
+
+    - 请求 ID 可用归并别名（自动解析到规范档案）；时间窗 ``end`` 必须晚于
+      ``start``（422）；展品未配置展陈开放日历时无法核算
+      ``calendar=display`` 剂量 → 409；
+    - 服务在**一个 SQLite 事务**内按**未作废权威时间线**重算诊断事件
+      （gap / jump / stuck / timestamp_conflict，与诊断接口同口径）与
+      ``calendar=display`` 剂量，连同**收据链末端哈希**固化为快照，
+      返回快照摘要 ``digest``（SHA-256）；
+    - ``request_key`` 为幂等键：相同请求（规范档案 / 时间窗 / 诊断阈值一致）
+      重放首次结果（``already_committed=true``），换目标 → 409；
+    - 快照不可变：``snapshot`` 与 ``digest`` 落库后绝不改写。
+    """
+    return create_ticket(conn, exhibit_id, payload)
+
+
+@app.get("/exhibits/{exhibit_id}/anomaly-tickets",
+         response_model=AnomalyTicketListOut, tags=["tickets"])
+def list_anomaly_tickets(
+    exhibit_id: str,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> AnomalyTicketListOut:
+    """列出规范档案的全部处置单（按创建时间升序）；别名自动解析。"""
+    return list_tickets(conn, exhibit_id)
+
+
+@app.get("/exhibits/{exhibit_id}/anomaly-tickets/{ticket_id}",
+         response_model=AnomalyTicketDetailOut, tags=["tickets"])
+def get_anomaly_ticket(
+    exhibit_id: str,
+    ticket_id: str,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> AnomalyTicketDetailOut:
+    """查询单张处置单：固化快照不变，另附按当前数据实时重算的摘要。
+
+    结案前以 ``current_digest`` 作为 ``expected_digest`` 提交；
+    ``digest_stale=true`` 表示读数 / 作废 / 来源优先级 / 日历 / 收据链
+    相对创建时已变化（日历被删除等无法重算时 ``current_digest`` 为 null）。
+    """
+    return get_ticket(conn, exhibit_id, ticket_id)
+
+
+@app.post("/exhibits/{exhibit_id}/anomaly-tickets/{ticket_id}/close",
+          response_model=AnomalyTicketOut, tags=["tickets"])
+def close_anomaly_ticket(
+    exhibit_id: str,
+    ticket_id: str,
+    payload: AnomalyTicketCloseRequest,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> AnomalyTicketOut:
+    """把 open 处置单结案为 resolved 或 accepted。
+
+    - 只能从 ``open`` 结案：已结案（resolved / accepted）再次结案 → 409；
+    - 服务在写事务内按固化的时间窗与阈值**重算当前摘要**，与
+      ``expected_digest`` 不一致（读数 / 作废 / 来源优先级 / 日历 / 收据链
+      已变化）→ **409 且不写入**；
+    - ``resolved`` 须给出涉及的收据或更正 ``request_key`` 佐证（须存在且
+      属于该规范档案），并证明**重算后原诊断事件全部消失、
+      calendar=display 剂量未越限**，否则 409；
+    - ``accepted`` 保留事件并记录理由（``events_kept``）；
+    - 结案只写状态与结案记录，创建时固化的快照与 digest 保持不变。
+    """
+    return close_ticket(conn, exhibit_id, ticket_id, payload)
 
 
 # ---------- 剂量核算 ----------
